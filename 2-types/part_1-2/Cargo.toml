@@ -1,0 +1,13 @@
+[package]
+name = "part_1-2"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
