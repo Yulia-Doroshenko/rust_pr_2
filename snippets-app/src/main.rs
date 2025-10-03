@@ -15,8 +15,8 @@ fn print_usage() {
     );
 }
 
-fn slugify(name: &str) -> String {
-    let lower = name.trim().to_lowercase();
+fn to_kebab_slug(input: &str) -> String {
+    let lower = input.trim().to_lowercase();
     let mut out = String::with_capacity(lower.len());
     for ch in lower.chars() {
         let ok = ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == ' ';
@@ -26,7 +26,7 @@ fn slugify(name: &str) -> String {
 }
 
 fn path_for(name: &str) -> PathBuf {
-    let slug = slugify(name);
+    let slug = to_kebab_slug(name);
     let mut p = PathBuf::from(STORE_DIR);
     p.push(format!("{slug}.txt"));
     p
