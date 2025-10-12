@@ -1,0 +1,10 @@
+{
+  "snippets": [
+    {
+      "name": "hello-world",
+      "lang": "rust",
+      "code": "fn main(){ println!(\"hi\"); }\r\n",
+      "created_at": "2025-10-12T15:53:49.259023Z"
+    }
+  ]
+}
