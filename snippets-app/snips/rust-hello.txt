@@ -1,0 +1,5 @@
+name: Rust hello
+lang: rust
+----
+println!(\
+hi\);
