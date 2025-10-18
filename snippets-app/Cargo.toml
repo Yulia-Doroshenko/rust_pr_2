@@ -4,9 +4,21 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-humantime-serde = "1"
-uuid = { version = "1", features = ["serde", "v4"] }
-url = { version = "2", features = ["serde"] }
-time = { version = "0.3", features = ["serde", "parsing", "formatting", "macros"] }
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+dotenvy = "0.15"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+assert_fs = "1.1"
+regex = "1.10"
+tempfile = "3.10"
+tiny_http = "0.12"
