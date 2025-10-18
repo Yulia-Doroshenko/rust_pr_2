@@ -1,18 +1,58 @@
 use std::{
+    collections::BTreeMap,
     env,
     fs::File,
     io::{self, Read},
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, OptionalExtension, types::Type};
+use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
-// ---------- Domain types ----------
+use tracing::{debug, info, warn};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{fmt, EnvFilter};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+struct Config {
+    log_level: String,
+    log_path: Option<PathBuf>,
+    json_path: PathBuf,
+}
+
+impl Config {
+    fn from_env_and_defaults(json_path: PathBuf) -> Self {
+        let log_level = env::var("SNIPPETS_APP_LOG_LEVEL").unwrap_or_else(|_| "info".to_owned());
+        let log_path = env::var("SNIPPETS_APP_LOG_PATH").ok().map(PathBuf::from);
+        Self { log_level, log_path, json_path }
+    }
+}
+
+fn init_tracing(cfg: &Config) -> Result<Option<WorkerGuard>> {
+    let filter = EnvFilter::try_new(&cfg.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
+    if let Some(path) = cfg.log_path.as_ref() {
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).ok(); }
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path)
+            .with_context(|| format!("opening log file '{}'", path.display()))?;
+        let (nb, guard) = tracing_appender::non_blocking(file);
+        fmt().with_env_filter(filter)
+             .with_target(true)
+             .with_level(true)
+             .with_ansi(false)
+             .with_writer(nb)
+             .init();
+        Ok(Some(guard))
+    } else {
+        fmt().with_env_filter(filter)
+             .with_target(true)
+             .with_level(true)
+             .init();
+        Ok(None)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
 struct Snippet {
     name: String,
     lang: String,
@@ -20,425 +60,137 @@ struct Snippet {
     created_at: DateTime<Utc>,
 }
 
-trait SnippetStorage {
-    fn create(&self, snip: &Snippet) -> Result<bool>;
-    fn read(&self, name: &str) -> Result<Option<Snippet>>;
-    fn delete(&self, name: &str) -> Result<bool>;
-    fn list(&self) -> Result<Vec<Snippet>>;
+#[derive(Default, Serialize, Deserialize)]
+struct Repo {
+    items: BTreeMap<String, Snippet>,
 }
 
-// ---------- Errors ----------
-
-#[derive(Debug, Error)]
-enum AppError {
-    #[error("I/O error at {path:?}")]
-    Io {
-        #[source]
-        source: io::Error,
-        path: PathBuf,
-    },
-
-    #[error("failed to (de)serialize JSON at {path:?}")]
-    SerdeJson {
-        #[source]
-        source: serde_json::Error,
-        path: PathBuf,
-    },
-
-    #[error("SQLite error")]
-    Sqlite(#[from] rusqlite::Error),
-
-    #[error("failed to parse RFC3339 datetime from DB: {raw}")]
-    ChronoParse {
-        #[source]
-        source: chrono::ParseError,
-        raw: String,
-    },
-
-    #[error("invalid storage provider specification: {0}")]
-    InvalidProvider(String),
-
-    #[error("stdin read error")]
-    Stdin(#[from] io::Error),
-}
-
-// ---------- JSON storage ----------
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-struct JsonFile {
-    snippets: Vec<Snippet>,
-}
-
-struct JsonStore {
-    path: PathBuf,
-}
-
-impl JsonStore {
-    fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
-    }
-
-    fn read_all(&self) -> Result<JsonFile> {
-        if !self.path.exists() {
-            return Ok(JsonFile::default());
+impl Repo {
+    fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
         }
-        let f = File::open(&self.path).map_err(|e| AppError::Io {
-            source: e,
-            path: self.path.clone(),
-        })?;
-        let v: JsonFile = serde_json::from_reader(f).map_err(|e| AppError::SerdeJson {
-            source: e,
-            path: self.path.clone(),
-        })?;
-        Ok(v)
+        let file = File::open(path).with_context(|| format!("open '{}'", path.display()))?;
+        let repo: Repo = serde_json::from_reader(io::BufReader::new(file))
+            .with_context(|| format!("parse JSON '{}'", path.display()))?;
+        Ok(repo)
     }
-
-    fn write_all(&self, data: &JsonFile) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| AppError::Io {
-                source: e,
-                path: parent.to_path_buf(),
-            })?;
-        }
-        let f = File::create(&self.path).map_err(|e| AppError::Io {
-            source: e,
-            path: self.path.clone(),
-        })?;
-        serde_json::to_writer_pretty(f, data).map_err(|e| AppError::SerdeJson {
-            source: e,
-            path: self.path.clone(),
-        })?;
+    fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).ok(); }
+        let file = File::create(path).with_context(|| format!("create '{}'", path.display()))?;
+        serde_json::to_writer_pretty(io::BufWriter::new(file), self)?;
         Ok(())
     }
 }
 
-impl SnippetStorage for JsonStore {
-    fn create(&self, snip: &Snippet) -> Result<bool> {
-        let mut data = self
-            .read_all()
-            .with_context(|| format!("loading JSON store from {:?}", self.path))?;
-        if data.snippets.iter().any(|s| s.name == snip.name) {
-            return Ok(false);
-        }
-        data.snippets.push(snip.clone());
-        self.write_all(&data)
-            .with_context(|| format!("writing JSON store to {:?}", self.path))?;
-        Ok(true)
-    }
+#[derive(Parser, Debug)]
+#[command(name = "snippets-app",
+          version,
+          about = "Store and manage code snippets; supports downloading via --download",
+          disable_help_subcommand = true)]
+struct Cli {
+    #[arg(long = "json-path", value_name = "PATH", default_value = "snippets.json")]
+    json_path: PathBuf,
 
-    fn read(&self, name: &str) -> Result<Option<Snippet>> {
-        let data = self
-            .read_all()
-            .with_context(|| format!("loading JSON store from {:?}", self.path))?;
-        Ok(data.snippets.into_iter().find(|s| s.name == name))
-    }
-
-    fn delete(&self, name: &str) -> Result<bool> {
-        let mut data = self
-            .read_all()
-            .with_context(|| format!("loading JSON store from {:?}", self.path))?;
-        let before = data.snippets.len();
-        data.snippets.retain(|s| s.name != name);
-        let changed = data.snippets.len() != before;
-        if changed {
-            self.write_all(&data)
-                .with_context(|| format!("writing JSON store to {:?}", self.path))?;
-        }
-        Ok(changed)
-    }
-
-    fn list(&self) -> Result<Vec<Snippet>> {
-        let mut v = self
-            .read_all()
-            .with_context(|| format!("loading JSON store from {:?}", self.path))?
-            .snippets;
-        v.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(v)
-    }
+    #[command(subcommand)]
+    cmd: Command,
 }
 
-// ---------- SQLite storage ----------
-
-struct SqliteStore {
-    conn: rusqlite::Connection,
+#[derive(Subcommand, Debug)]
+enum Command {
+    Add(AddCmd),
+    List,
+    Remove(RemoveCmd),
 }
 
-impl SqliteStore {
-    fn new(path: impl AsRef<Path>) -> Result<Self> {
-        if let Some(parent) = path.as_ref().parent() {
-            std::fs::create_dir_all(parent).map_err(|e| AppError::Io {
-                source: e,
-                path: parent.to_path_buf(),
-            })?;
-        }
-        let conn = rusqlite::Connection::open(path.as_ref()).with_context(|| {
-            format!("opening SQLite DB at {:?}", path.as_ref())
-        })?;
-        conn.execute_batch(
-            r#"
-            PRAGMA journal_mode=WAL;
-            CREATE TABLE IF NOT EXISTS snippets (
-                name        TEXT PRIMARY KEY,
-                lang        TEXT NOT NULL,
-                code        TEXT NOT NULL,
-                created_at  TEXT NOT NULL
-            );
-            "#,
-        )
-        .context("initializing SQLite schema")?;
-        Ok(Self { conn })
+#[derive(Args, Debug)]
+struct AddCmd {
+    #[arg(short = 'n', long = "name")]
+    name: String,
+
+    #[arg(short = 'l', long = "lang", default_value = "text")]
+    lang: String,
+
+    #[arg(long = "download", value_name = "URL")]
+    download: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct RemoveCmd {
+    #[arg(short = 'n', long = "name")]
+    name: String,
+}
+
+fn read_stdin_text() -> Result<String> {
+    let mut buf = Vec::new();
+    io::stdin().read_to_end(&mut buf).context("read from STDIN")?;
+    if buf.is_empty() {
+        return Err(anyhow!("STDIN is empty; pass --download <URL> or pipe content"));
     }
+    Ok(String::from_utf8_lossy(&buf).to_string())
 }
 
-impl SnippetStorage for SqliteStore {
-    fn create(&self, snip: &Snippet) -> Result<bool> {
-        let res = self
-            .conn
-            .execute(
-                "INSERT OR IGNORE INTO snippets(name, lang, code, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    snip.name,
-                    snip.lang,
-                    snip.code,
-                    snip.created_at.to_rfc3339(),
-                ],
-            )
-            .context("inserting snippet into SQLite")?;
-        Ok(res == 1)
+fn fetch_url(url: &str) -> Result<String> {
+    info!(target: "snippets", url = url, "downloading snippet");
+    let resp = reqwest::blocking::get(url).with_context(|| format!("GET {}", url))?;
+    let st = resp.status();
+    if !st.is_success() {
+        return Err(anyhow!("HTTP {}", st));
     }
-
-fn read(&self, name: &str) -> Result<Option<Snippet>> {
-    self.conn
-        .query_row(
-            "SELECT name, lang, code, created_at FROM snippets WHERE name = ?1",
-            params![name],
-            |row| {
-                let raw: String = row.get(3)?;
-                let created_at = DateTime::parse_from_rfc3339(&raw)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        Type::Text,
-                        Box::new(e),
-                    ))?;
-
-                Ok(Snippet {
-                    name: row.get(0)?,
-                    lang: row.get(1)?,
-                    code: row.get(2)?,
-                    created_at,
-                })
-            },
-        )
-        .optional()
-        .context("selecting snippet from SQLite")
-    }
-
-    fn delete(&self, name: &str) -> Result<bool> {
-        let n = self
-            .conn
-            .execute("DELETE FROM snippets WHERE name = ?1", params![name])
-            .context("deleting snippet from SQLite")?;
-        Ok(n == 1)
-    }
-
-    fn list(&self) -> Result<Vec<Snippet>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT name, lang, code, created_at FROM snippets ORDER BY name ASC")
-            .context("preparing SQLite SELECT for list()")?;
-
-        let rows = stmt
-            .query_map([], |row| {
-                let raw: String = row.get(3)?;
-                let created_at = DateTime::parse_from_rfc3339(&raw)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        Type::Text,
-                        Box::new(e),
-                    ))?;
-
-                Ok(Snippet {
-                    name: row.get(0)?,
-                    lang: row.get(1)?,
-                    code: row.get(2)?,
-                    created_at,
-                })
-            })
-            .context("iterating SQLite rows for list()")?;
-
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.context("mapping row into Snippet")?);
-        }
-        Ok(out)
-    }
+    let text = resp.text().context("read response body")?;
+    Ok(text)
 }
-
-// ---------- CLI helpers ----------
-
-fn print_usage() {
-    eprintln!(
-        "Usage:
-  echo \"code\" | snippets-app --name \"<name>\" [--lang <lang>]
-  snippets-app --read \"<name>\"
-  snippets-app --delete \"<name>\"
-  snippets-app --list
-
-Storage selection (env):
-  SNIPPETS_APP_STORAGE=\"JSON:/path/to/snippets.json\"
-  SNIPPETS_APP_STORAGE=\"SQLITE:/path/to/snippets.sqlite\"
-"
-    );
-}
-
-fn to_kebab_slug(input: &str) -> String {
-    let lower = input.trim().to_lowercase();
-    let mut out = String::with_capacity(lower.len());
-    for ch in lower.chars() {
-        let ok = ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == ' ';
-        out.push(if ok { ch } else { ' ' });
-    }
-    out.split_whitespace().collect::<Vec<_>>().join("-")
-}
-
-enum Provider {
-    Json(PathBuf),
-    Sqlite(PathBuf),
-}
-
-fn pick_provider_from_env() -> Result<Provider> {
-    let raw = env::var("SNIPPETS_APP_STORAGE").unwrap_or_else(|_| "JSON:snips/snippets.json".into());
-    let (kind, path) = raw
-        .split_once(':')
-        .map(|(k, p)| (k.trim(), p.trim()))
-        .unwrap_or(("JSON", "snips/snippets.json"));
-
-    let pb = PathBuf::from(path);
-    let prov = match kind.to_uppercase().as_str() {
-        "SQLITE" | "SQLITE3" => Provider::Sqlite(pb),
-        "JSON" => Provider::Json(pb),
-        other => {
-            return Err(AppError::InvalidProvider(format!(
-                "unknown kind '{other}', expected JSON or SQLITE; raw={raw}"
-            ))
-            .into())
-        }
-    };
-    Ok(prov)
-}
-
-fn open_storage() -> Result<Box<dyn SnippetStorage>> {
-    match pick_provider_from_env().context("parsing SNIPPETS_APP_STORAGE")? {
-        Provider::Json(p) => {
-            if let Some(parent) = p.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| AppError::Io {
-                    source: e,
-                    path: parent.to_path_buf(),
-                })?;
-            }
-            Ok(Box::new(JsonStore::new(p)))
-        }
-        Provider::Sqlite(p) => Ok(Box::new(
-            SqliteStore::new(&p).with_context(|| format!("opening SQLite at {:?}", p))?,
-        )),
-    }
-}
-
-// ---------- Main ----------
 
 fn main() -> Result<()> {
-    let args = env::args().skip(1).collect::<Vec<_>>();
-    if args.is_empty() {
-        print_usage();
-        return Ok(());
-    }
+    let _ = dotenvy::dotenv();
+    let cli = Cli::parse();
+    let cfg = Config::from_env_and_defaults(cli.json_path.clone());
+    let _guard = init_tracing(&cfg)?;
 
-    let store = open_storage().context("initializing storage")?;
+    debug!("Starting with json_path='{}'", cfg.json_path.display());
 
-    match args[0].as_str() {
-        "--name" => {
-            if args.len() < 2 {
-                eprintln!("need: --name \"<name>\" [--lang <lang>\"]");
+    let mut repo = Repo::load(&cfg.json_path)?;
+
+    match cli.cmd {
+        Command::List => {
+            if repo.items.is_empty() {
+                println!("(no snippets yet)");
                 return Ok(());
             }
-            let name = to_kebab_slug(&args[1]);
-            if name.is_empty() {
-                bail!("empty name after slug normalization");
+            for sn in repo.items.values() {
+                println!("{} [{}] @{}", sn.name, sn.lang, sn.created_at.to_rfc3339());
             }
-
-            let lang = if args.len() >= 4 && args[2].as_str() == "--lang" {
-                Some(args[3].as_str())
+            info!(count = repo.items.len(), "listed snippets");
+        }
+        Command::Remove(RemoveCmd { name }) => {
+            let existed = repo.items.remove(&name).is_some();
+            repo.save(&cfg.json_path)?;
+            if existed {
+                println!("Removed '{name}'");
+                info!(name = %name, "removed");
             } else {
-                None
+                println!("No snippet named '{name}'");
+                warn!(name = %name, "remove requested but not found");
+            }
+        }
+        Command::Add(AddCmd { name, lang, download }) => {
+            let code = if let Some(url) = download.as_deref() {
+                fetch_url(url)?
+            } else {
+                read_stdin_text()?
             };
 
-            let mut buf = String::new();
-            io::stdin()
-                .read_to_string(&mut buf)
-                .context("reading snippet code from stdin")?;
-
-            if buf.trim().is_empty() {
-                bail!("stdin is empty; provide code via pipe or redirection");
-            }
-
-            let snip = Snippet {
-                name,
-                lang: lang.unwrap_or("").to_string(),
-                code: buf,
+            let sn = Snippet {
+                name: name.clone(),
+                lang,
+                code,
                 created_at: Utc::now(),
             };
-            let created = store
-                .create(&snip)
-                .with_context(|| format!("creating snippet '{}'", snip.name))?;
-            if created {
-                println!("Saved");
-            } else {
-                eprintln!("snippet already exists");
-            }
+            repo.items.insert(name.clone(), sn);
+            repo.save(&cfg.json_path)?;
+            println!("Saved '{name}'");
+            info!(name = %name, "saved/updated");
         }
-
-        "--read" => {
-            if args.len() < 2 {
-                eprintln!("need: --read \"<name>\"");
-                return Ok(());
-            }
-            let name = to_kebab_slug(&args[1]);
-            match store
-                .read(&name)
-                .with_context(|| format!("reading snippet '{name}'"))?
-            {
-                Some(s) => print!("{}", s.code),
-                None => eprintln!("not found: {}", name),
-            }
-        }
-
-        "--delete" => {
-            if args.len() < 2 {
-                eprintln!("need: --delete \"<name>\"");
-                return Ok(());
-            }
-            let name = to_kebab_slug(&args[1]);
-            if store
-                .delete(&name)
-                .with_context(|| format!("deleting snippet '{name}'"))?
-            {
-                println!("Deleted");
-            } else {
-                eprintln!("not found: {}", name);
-            }
-        }
-
-        "--list" => {
-            let mut items = store.list().context("listing snippets")?;
-            items.sort_by(|a, b| a.name.cmp(&b.name));
-            for s in items {
-                println!("{}  [{}]  created_at={}", s.name, s.lang, s.created_at.to_rfc3339());
-            }
-        }
-
-        _ => print_usage(),
     }
 
     Ok(())

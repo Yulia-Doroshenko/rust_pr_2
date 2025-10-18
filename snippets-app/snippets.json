@@ -1,0 +1,10 @@
+{
+  "items": {
+    "minimalistic_tracing_logger": {
+      "name": "minimalistic_tracing_logger",
+      "lang": "text",
+      "code": "fn init_logger() {\n    use std::io;\n\n    use tracing_subscriber::prelude::*;\n    use tracing_subscriber::EnvFilter;\n\n    let logging_filter: EnvFilter = EnvFilter::builder()\n        .with_default_directive(\"trace\".parse().unwrap())\n        .from_env_lossy();\n\n    let stdout_layer = tracing_subscriber::fmt::layer().pretty().with_writer(io::stdout);\n    \n    tracing_subscriber::registry()\n        .with(stdout_layer)\n        .with(logging_filter).init();\n}",
+      "created_at": "2025-10-18T12:26:18.639428300Z"
+    }
+  }
+}
