@@ -1,0 +1,9 @@
+[package]
+name = "demo-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+btreemap-decl = { path = "../btreemap-decl" }
+btreemap-proc = { path = "../btreemap-proc" }
