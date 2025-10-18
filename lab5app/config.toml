@@ -1,0 +1,28 @@
+debug = true
+
+[server]
+external_url = "http://localhost"
+http_port    = 8088
+grpc_port    = 8089
+healthz_port = 10026
+metrics_port = 9200
+
+[db.mysql]
+host   = "db.local"
+port   = 3307
+dating = "prod"
+user   = "app"
+pass   = "secret"
+
+[db.mysql.connections]
+max_idle = 10
+max_open = 40
+
+[log.app]
+# one of: error, warn, info, debug, trace
+level = "warn"
+
+[background.watchdog]
+period       = "7s"
+limit        = 5
+lock_timeout = "6s"
